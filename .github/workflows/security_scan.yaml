@@ -1,0 +1,382 @@
+#
+# SEC-04 fleet security scan: Bandit (Python), Semgrep and Grype, defined once
+# and called from every mabel-dev repository's own security_scan.yaml, which
+# only owns the triggers (push, pull_request, a daily cron).
+#
+# Every finding from every tool is flattened to one row format and appended to
+# opteryx.ops.pipeline_scan_findings. It replaced the per-repository
+# upload_semgrep_results.py / upload_bandit_results.py / upload_grype_results.py
+# scripts (each wrote its own shape to its own dataset; all removed in SEC-04). The README
+# that ships with SEC-04 documents every column.
+#
+# What fails the job:
+#   - any tool error: a non-zero exit, a missing or unparsable report, or an
+#     error the tool reports inside its own JSON (Bandit lists files it could
+#     not parse there and still exits 0). Every event, schedule included.
+#   - a failed upload to Opteryx.
+#   - on pull_request only: a high/critical finding in the merge commit that the
+#     pull request base does not have (see "Evaluate" for the fingerprint).
+# Push and schedule runs report everything and never fail for findings.
+#
+# Authentication is GitHub OIDC: no stored secret. The calling repository must
+# be registered in authenticate.opteryx (scripts/register_federated_credential.py)
+# against a client that may append to the dataset, with no job_workflow_ref
+# constraint or one naming this file. Callers grant id-token: write.
+#
+
+name: Security Scan
+
+on:
+  workflow_call:
+    inputs:
+      python:
+        description: >-
+          Run Bandit. Required so each caller states it; false on a repository
+          with no Python leaves Bandit out of the run.
+        type: boolean
+        required: true
+      bandit-config:
+        description: >-
+          Bandit config file relative to the repository root, passed as -c.
+          Empty runs Bandit with its defaults.
+        type: string
+        required: false
+        default: ""
+      image-ref:
+        description: >-
+          Grype source for a built image, e.g.
+          registry:us-east1-docker.pkg.dev/project/repo/image@sha256:... Empty
+          skips the image scan. Report-only: there is no base image to diff a
+          pull request against, so image findings never fail the job.
+        type: string
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  scan:
+    name: Bandit, Semgrep, Grype
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    env:
+      # Pinned so a red build is reproducible from its own log. Bumping one is a
+      # reviewed change to this file, not something a run picks up by itself.
+      BANDIT_VERSION: "1.9.4"
+      SEMGREP_VERSION: "1.186.0"
+      GRYPE_VERSION: "0.122.1"
+      GRYPE_SHA256: "f1ba7e2917ee1395618de20a98da0aa7c0fb1788927797651047c50502a37538" # grype_0.122.1_linux_amd64.tar.gz
+      RUGO_VERSION: "0.5.12"
+      OPTERYX_UPLOAD_VERSION: "0.6.0"
+      # The registry ruleset the retired per-repo semgrep_scan.yaml used. It is
+      # resolved at run time, so the rules are not pinned by SEMGREP_VERSION.
+      SEMGREP_RULES: auto
+      SEMGREP_ENABLE_VERSION_CHECK: "0"
+      GRYPE_CHECK_FOR_APP_UPDATE: "false"
+      # Updated once by its own step, so a pull request's base and head scans
+      # are judged against the same vulnerability data.
+      GRYPE_DB_AUTO_UPDATE: "false"
+      PYTHON_SCAN: ${{ inputs.python }}
+      BANDIT_CONFIG: ${{ inputs.bandit-config }}
+      IMAGE_REF: ${{ inputs.image-ref }}
+      OUT: ${{ github.workspace }}/security-scan
+      BASE_OUT: ${{ github.workspace }}/security-scan-base
+    steps:
+      # On pull_request this is the merge commit, so diffing it against the
+      # base commit isolates exactly what the pull request brings in.
+      - name: Check out the commit under scan
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: head
+          persist-credentials: false
+
+      - name: Check out the pull request base
+        if: github.event_name == 'pull_request'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: base
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          # Bandit parses with the interpreter it runs on; an older one reports
+          # newer syntax as a parse error, which this workflow treats as a failure.
+          python-version: "3.14"
+
+      - name: Install scanners and the upload client
+        run: |
+          # Outside the checkouts, so neither tree's scan sees the scanners themselves.
+          python -m venv "$RUNNER_TEMP/scanners"
+          pkgs=("semgrep==$SEMGREP_VERSION" "rugo==$RUGO_VERSION" "opteryx-upload==$OPTERYX_UPLOAD_VERSION")
+          if [ "$PYTHON_SCAN" = "true" ]; then pkgs+=("bandit==$BANDIT_VERSION"); fi
+          "$RUNNER_TEMP/scanners/bin/pip" install --no-cache-dir "${pkgs[@]}"
+          echo "$RUNNER_TEMP/scanners/bin" >> "$GITHUB_PATH"
+
+          curl -sSfL -o "$RUNNER_TEMP/grype.tar.gz" \
+            "https://github.com/anchore/grype/releases/download/v${GRYPE_VERSION}/grype_${GRYPE_VERSION}_linux_amd64.tar.gz"
+          echo "${GRYPE_SHA256}  $RUNNER_TEMP/grype.tar.gz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/grype-bin"
+          tar -xzf "$RUNNER_TEMP/grype.tar.gz" -C "$RUNNER_TEMP/grype-bin" grype
+          echo "$RUNNER_TEMP/grype-bin" >> "$GITHUB_PATH"
+
+      - name: Update the Grype vulnerability database
+        run: |
+          grype db update
+          grype db status
+
+      - name: Report tool versions
+        run: |
+          python --version
+          semgrep --version
+          if [ "$PYTHON_SCAN" = "true" ]; then bandit --version; fi
+          grype version
+
+      - name: Scan
+        run: |
+          # Each tool runs from inside the tree, so reported paths are repo-relative.
+          scan() (
+            tree="$1" out="$2"
+            mkdir -p "$out"
+            cd "$GITHUB_WORKSPACE/$tree"
+            if [ "$PYTHON_SCAN" = "true" ]; then
+              # --exit-zero stops findings from failing this step; the Evaluate
+              # step judges findings. A crash still exits non-zero, and
+              # unparsable files land in the report's "errors" list.
+              bandit -r . ${BANDIT_CONFIG:+-c "$BANDIT_CONFIG"} -f json -o "$out/bandit.json" --exit-zero
+            fi
+            semgrep scan --config "$SEMGREP_RULES" --json --output "$out/semgrep.json" .
+            grype dir:. -o json --file "$out/grype.json"
+          )
+          scan head "$OUT"
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then scan base "$BASE_OUT"; fi
+          if [ -n "$IMAGE_REF" ]; then grype "$IMAGE_REF" -o json --file "$OUT/grype-image.json"; fi
+
+      # Fails on tool errors only. Findings are flattened to rows here and
+      # judged by the last step, so they are still uploaded on a pull request
+      # that the gate is about to fail.
+      - name: Evaluate
+        id: evaluate
+        shell: python
+        run: |
+          import hashlib, json, os, sys
+          from collections import Counter
+          from datetime import datetime, timezone
+
+          env = os.environ
+          ws, out, base_out = env["GITHUB_WORKSPACE"], env["OUT"], env["BASE_OUT"]
+          is_pr = env["GITHUB_EVENT_NAME"] == "pull_request"
+          python_scan = env["PYTHON_SCAN"] == "true"
+          pr = json.load(open(env["GITHUB_EVENT_PATH"])).get("pull_request") or {}
+
+          # Every tool's severity mapped onto one scale. An unmapped value raises:
+          # a tool that starts emitting a new label must be mapped, not guessed.
+          BANDIT_SEVERITY = {"HIGH": "high", "MEDIUM": "medium", "LOW": "low", "UNDEFINED": "unknown"}
+          # Semgrep's own equivalence: ERROR = HIGH, WARNING = MEDIUM, INFO = LOW.
+          SEMGREP_SEVERITY = {"CRITICAL": "critical", "ERROR": "high", "HIGH": "high", "WARNING": "medium",
+                              "MEDIUM": "medium", "INFO": "low", "LOW": "low"}
+          GRYPE_SEVERITY = {"Critical": "critical", "High": "high", "Medium": "medium", "Low": "low",
+                            "Negligible": "negligible", "Unknown": "unknown"}
+          GATED = {"critical", "high"}
+
+
+          def load(path, tool, errors):
+              # A missing or unparsable report is a tool error: let it raise.
+              with open(path) as f:
+                  report = json.load(f)
+              if tool == "bandit":
+                  errors += [f"{path}: {e['reason']} ({e['filename']})" for e in report["errors"]]
+              if tool == "semgrep":
+                  errors += [f"{path}: {e.get('message')} ({e.get('path')})" for e in report["errors"] if e["level"] == "error"]
+              return report
+
+
+          def source(tree, path, start, end):
+              # Fingerprint anchor: the flagged source lines, whitespace-collapsed.
+              # Line numbers stay out, so code moving within a file is not new.
+              with open(f"{ws}/{tree}/{path}", errors="replace") as f:
+                  lines = f.read().splitlines()[start - 1:end]
+              return " ".join(" ".join(lines).split())
+
+
+          def finding(tool, target, rule_id, severity, tool_severity, path, start, end, message, anchor, **extra):
+              row = dict.fromkeys(("rule_name", "confidence", "cwe", "owasp", "reference", "package", "package_version",
+                                   "package_type", "purl", "fix_state", "fix_versions"))
+              row.update(extra, tool=tool, target=target, rule_id=rule_id, severity=severity,
+                         tool_severity=tool_severity, path=path, start_line=start, end_line=end, message=message)
+              row["fingerprint"] = hashlib.sha256("\x1f".join((tool, target, rule_id, path, anchor)).encode()).hexdigest()
+              return row
+
+
+          def flatten(tool, report, tree, target):
+              rows = []
+              if tool == "bandit":
+                  for r in report["results"]:
+                      path = r["filename"].removeprefix("./")
+                      start, end = min(r["line_range"]), max(r["line_range"])
+                      cwe = (r.get("issue_cwe") or {}).get("id")
+                      rows.append(finding(tool, target, r["test_id"], BANDIT_SEVERITY[r["issue_severity"]], r["issue_severity"],
+                                          path, start, end, r["issue_text"], source(tree, path, start, end),
+                                          rule_name=r["test_name"], confidence=r["issue_confidence"],
+                                          cwe=f"CWE-{cwe}" if cwe is not None else None, reference=r["more_info"]))
+              elif tool == "semgrep":
+                  for r in report["results"]:
+                      meta = r["extra"].get("metadata", {})
+                      start, end = r["start"]["line"], r["end"]["line"]
+                      rows.append(finding(tool, target, r["check_id"], SEMGREP_SEVERITY[r["extra"]["severity"]], r["extra"]["severity"],
+                                          r["path"], start, end, r["extra"]["message"], source(tree, r["path"], start, end),
+                                          confidence=meta.get("confidence"),
+                                          cwe=", ".join(c.split(":")[0] for c in meta.get("cwe", [])) or None,
+                                          owasp=", ".join(meta.get("owasp", [])) or None, reference=meta.get("source")))
+              else:  # grype
+                  for m in report["matches"]:
+                      v, a = m["vulnerability"], m["artifact"]
+                      path = a["locations"][0]["path"] if a["locations"] else ""
+                      if target == "repository":
+                          path = path.removeprefix("/")  # Grype writes "/requirements.txt" for a directory scan
+                      # Grype has no source lines; the package (not its version) anchors the
+                      # finding, so bumping a still-affected package is not a new finding.
+                      rows.append(finding(tool, target, v["id"], GRYPE_SEVERITY[v["severity"]], v["severity"],
+                                          path, None, None, v.get("description"), f"{a['type']}:{a['name']}",
+                                          cwe=", ".join(sorted({c["cwe"] for c in v.get("cwes") or []})) or None,
+                                          reference=v.get("dataSource"), package=a["name"], package_version=a["version"],
+                                          package_type=a["type"], purl=a.get("purl"), fix_state=v["fix"]["state"],
+                                          fix_versions=", ".join(v["fix"]["versions"]) or None))
+              return rows
+
+
+          # (tool, report file stem, target). Only the repository scans are gated:
+          # there is no base image to diff an image scan against.
+          scans = ([("bandit", "bandit", "repository")] if python_scan else []) + [
+              ("semgrep", "semgrep", "repository"), ("grype", "grype", "repository")]
+          image = [("grype", "grype-image", env["IMAGE_REF"])] if env["IMAGE_REF"] else []
+
+          errors, rows, summary = [], [], []
+          for tool, stem, target in scans + image:
+              head_rows = flatten(tool, load(f"{out}/{stem}.json", tool, errors), "head", target)
+              gated = [r for r in head_rows if r["severity"] in GATED]
+              new = None
+              if is_pr and target == "repository":
+                  # Multiset difference: a fingerprint counts as new only for
+                  # occurrences beyond the number the base already had.
+                  base_rows = flatten(tool, load(f"{base_out}/{stem}.json", tool, errors), "base", target)
+                  base_counts = Counter(r["fingerprint"] for r in base_rows if r["severity"] in GATED)
+                  seen, new = Counter(), 0
+                  for r in head_rows:
+                      r["new_vs_base"] = False
+                  for r in gated:
+                      seen[r["fingerprint"]] += 1
+                      r["new_vs_base"] = seen[r["fingerprint"]] > base_counts[r["fingerprint"]]
+                      new += r["new_vs_base"]
+              rows += head_rows
+              summary.append((tool, target, len(head_rows), len(gated), new))
+
+          if errors:
+              for e in errors:
+                  print(f"::error title=Security scan tool error::{e}")
+              sys.exit(f"{len(errors)} tool error(s); the scan is incomplete and nothing is uploaded.")
+
+
+          def esc(text):
+              return text.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+
+
+          def esc_prop(text):
+              return esc(text).replace(":", "%3A").replace(",", "%2C")
+
+
+          new_rows = [r for r in rows if r.get("new_vs_base")]
+          for r in new_rows:
+              title = esc_prop(f"New {r['severity']} {r['tool']} finding: {r['rule_id']}")
+              print(f"::error file={esc_prop(r['path'])},line={r['start_line'] or 1},title={title}::{esc(r['message'] or r['rule_id'])}")
+
+          run = {
+              "scan_time": datetime.now(timezone.utc).isoformat(timespec="microseconds"),
+              "repo": env["GITHUB_REPOSITORY"],
+              "commit_sha": env["GITHUB_SHA"],
+              "ref": env["GITHUB_REF"],
+              "trigger": env["GITHUB_EVENT_NAME"],
+              "run_id": int(env["GITHUB_RUN_ID"]),
+              "run_attempt": int(env["GITHUB_RUN_ATTEMPT"]),
+              "pull_request": pr["number"] if is_pr else None,
+              "base_sha": pr["base"]["sha"] if is_pr else None,
+          }
+          versions = {"bandit": env["BANDIT_VERSION"], "semgrep": env["SEMGREP_VERSION"], "grype": env["GRYPE_VERSION"]}
+          with open(f"{out}/findings.ndjson", "w") as f:
+              for r in rows:
+                  f.write(json.dumps({**run, "tool_version": versions[r["tool"]], "new_vs_base": None, **r}) + "\n")
+
+          with open(env["GITHUB_STEP_SUMMARY"], "a") as f:
+              f.write(f"### Security scan ({'new high/critical vs base' if is_pr else 'report only'})\n\n"
+                      "| tool | target | findings | high/critical | new vs base |\n|---|---|---|---|---|\n")
+              for tool, target, n, g, new in summary:
+                  f.write(f"| {tool} | {target} | {n} | {g} | {'' if new is None else new} |\n")
+              if not python_scan:
+                  f.write("| bandit | repository | skipped | | |\n")
+
+          with open(env["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"new_high_critical={len(new_rows)}\nfindings={len(rows)}\n")
+
+      - name: Upload findings to Opteryx
+        shell: python
+        env:
+          FINDINGS: ${{ steps.evaluate.outputs.findings }}
+          FORK: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
+        run: |
+          import os, sys
+          from opteryx_upload import ConflictResolution, GitHubOIDCAuthenticator, Target, UploadClient
+          from rugo.jsonl import read_jsonl
+          from rugo.parquet import write_parquet
+
+          env = os.environ
+          # Declared, not inferred: a column that is null in every row of one run
+          # (package, for a repository with no dependency findings) must still
+          # land with the type every other run gives it.
+          SCHEMA = {
+              "scan_time": "TIMESTAMP[us]", "repo": "VARCHAR", "commit_sha": "VARCHAR", "ref": "VARCHAR",
+              "trigger": "VARCHAR", "run_id": "INT64", "run_attempt": "INT64", "pull_request": "INT64",
+              "base_sha": "VARCHAR", "tool": "VARCHAR", "tool_version": "VARCHAR", "target": "VARCHAR",
+              "rule_id": "VARCHAR", "rule_name": "VARCHAR", "severity": "VARCHAR", "tool_severity": "VARCHAR",
+              "confidence": "VARCHAR", "path": "VARCHAR", "start_line": "INT64", "end_line": "INT64",
+              "message": "VARCHAR", "cwe": "VARCHAR", "owasp": "VARCHAR", "reference": "VARCHAR",
+              "package": "VARCHAR", "package_version": "VARCHAR", "package_type": "VARCHAR", "purl": "VARCHAR",
+              "fix_state": "VARCHAR", "fix_versions": "VARCHAR", "fingerprint": "VARCHAR", "new_vs_base": "BOOL",
+              }
+          TARGET = Target(workspace="opteryx", collection="ops", dataset="pipeline_scan_findings")
+
+          if env["FORK"] == "true":
+              print("::notice::Pull request from a fork: GitHub gives it no OIDC token, so nothing is uploaded. The gate still runs.")
+              sys.exit(0)
+          if env["FINDINGS"] == "0":
+              print("No findings; nothing to upload.")
+              sys.exit(0)
+
+          ndjson = f"{env['OUT']}/findings.ndjson"
+          parquet = f"{env['OUT']}/findings.parquet"
+          with read_jsonl(ndjson, explicit_schema=SCHEMA) as reader:
+              morsels = list(reader)
+          assert len(morsels) == 1, f"expected one morsel from read_jsonl, got {len(morsels)}"
+          with open(parquet, "wb") as f:
+              f.write(write_parquet(morsels[0]))
+
+          commit = UploadClient(token=GitHubOIDCAuthenticator()).upload_and_commit(
+              [parquet],
+              TARGET,
+              snapshot_message=f"security scan {env['GITHUB_REPOSITORY']}@{env['GITHUB_SHA'][:12]} ({env['GITHUB_EVENT_NAME']})",
+              conflict_resolution=ConflictResolution.APPEND,
+          )
+          print(f"uploaded {env['FINDINGS']} findings -> {commit.table} (commit {commit.commit_id})")
+
+      - name: Fail on new high/critical findings
+        if: steps.evaluate.outputs.new_high_critical != '0'
+        env:
+          NEW: ${{ steps.evaluate.outputs.new_high_critical }}
+        run: |
+          echo "::error title=Security gate::$NEW new high/critical finding(s) versus the pull request base; each is annotated above."
+          exit 1

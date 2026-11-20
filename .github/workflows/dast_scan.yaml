@@ -1,0 +1,257 @@
+#
+# SEC-07 fleet DAST scan: the OWASP ZAP baseline scan of a deployed site,
+# defined once and called from each mabel-dev repository that serves one. The
+# caller owns only the triggers (after its deploy, and a daily cron) and the URL.
+#
+# The baseline scan is passive: it spiders the site and inspects the responses
+# (headers, cookies, CORS, caching, information leaks). It sends no attack
+# payloads and submits no forms, so it is safe against production. The active
+# scan is deliberately not offered here.
+#
+# Findings are flattened to the same row format as security_scan.yaml and
+# appended to opteryx.ops.pipeline_scan_findings:
+#   tool = zap, target = the scanned URL, rule_id = ZAP alertRef (the plugin
+#   id, or plugin-n where one plugin raises several alerts, as 90004 does),
+#   path = "METHOD /url/path", start_line/end_line = null,
+#   severity: ZAP risk 3 high, 2 medium, 1 low, 0 informational.
+# The fingerprint is (tool, target, alertRef, method + path, param), so the
+# same alert on the same URL is the same finding across deploys. The query
+# string is left out, and a run keeps one row per fingerprint.
+#
+# What fails the job:
+#   - ZAP itself failing (exit 3 or above), or a missing or unparsable report.
+#   - a failed upload to Opteryx.
+# Findings never fail the job: by the time this runs the site is already live.
+#
+# Authentication is GitHub OIDC, as in security_scan.yaml. If the caller's
+# federated credential in authenticate.opteryx has a job_workflow_ref
+# constraint, it must also allow this file. Callers grant id-token: write.
+#
+
+name: DAST Scan
+
+on:
+  workflow_call:
+    inputs:
+      url:
+        description: The deployed site to scan, e.g. https://notebooks.opteryx.app
+        type: string
+        required: true
+      rules:
+        description: >-
+          ZAP rules file (tab-separated: plugin id, IGNORE|INFO|WARN|FAIL, name)
+          relative to the caller's repository root, passed as -c. Empty uses
+          ZAP's defaults. Set a rule to IGNORE to drop it from the report.
+        type: string
+        required: false
+        default: ""
+      minutes:
+        description: Spider duration in minutes (zap-baseline.py -m).
+        type: number
+        required: false
+        default: 2
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  scan:
+    name: ZAP baseline
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    env:
+      # Pinned by digest so a run is reproducible from its own log. Bumping it
+      # is a reviewed change to this file.
+      ZAP_IMAGE: ghcr.io/zaproxy/zaproxy:2.17.0@sha256:9624669db72f54d86c4b46a7064518bd9bf79d8c61a4c31befa9923489f328af
+      RUGO_VERSION: "0.5.12"
+      OPTERYX_UPLOAD_VERSION: "0.6.0"
+      TARGET_URL: ${{ inputs.url }}
+      RULES: ${{ inputs.rules }}
+      MINUTES: ${{ inputs.minutes }}
+      OUT: ${{ github.workspace }}/dast-scan
+    steps:
+      - name: Check out the caller (for its rules file)
+        if: inputs.rules != ''
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: head
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.14"
+
+      - name: Install the upload client
+        run: |
+          python -m venv "$RUNNER_TEMP/tools"
+          "$RUNNER_TEMP/tools/bin/pip" install --no-cache-dir "rugo==$RUGO_VERSION" "opteryx-upload==$OPTERYX_UPLOAD_VERSION"
+          echo "$RUNNER_TEMP/tools/bin" >> "$GITHUB_PATH"
+
+      - name: Scan
+        run: |
+          mkdir -p "$OUT"
+          # The image runs as its own zap user, which must be able to write the report.
+          chmod 777 "$OUT"
+          config=()
+          if [ -n "$RULES" ]; then
+            cp "$GITHUB_WORKSPACE/head/$RULES" "$OUT/rules.tsv"
+            config=(-c rules.tsv)
+          fi
+          docker pull -q "$ZAP_IMAGE"
+          # -I: warnings do not set the exit code. 0 = clean, 1 = FAIL-level
+          # alerts, 2 = warnings; all are findings, judged by nothing here.
+          # 3 or above is ZAP itself failing.
+          set +e
+          docker run --rm -v "$OUT:/zap/wrk:rw" "$ZAP_IMAGE" \
+            zap-baseline.py -t "$TARGET_URL" -m "$MINUTES" -J zap.json -I "${config[@]}"
+          rc=$?
+          set -e
+          echo "zap-baseline.py exited $rc"
+          if [ "$rc" -ge 3 ]; then
+            echo "::error title=ZAP failed::zap-baseline.py exited $rc; the scan is incomplete and nothing is uploaded."
+            exit 1
+          fi
+          # ZAP exits 0 even when it could not write the report.
+          if [ ! -s "$OUT/zap.json" ]; then
+            echo "::error title=ZAP failed::no report was written; the scan is incomplete and nothing is uploaded."
+            exit 1
+          fi
+
+      - name: Evaluate
+        id: evaluate
+        shell: python
+        run: |
+          import hashlib, html, json, os, re
+          from collections import Counter
+          from datetime import datetime, timezone
+          from urllib.parse import urlsplit
+
+          env = os.environ
+          out, target = env["OUT"], env["TARGET_URL"]
+
+          # An unmapped value raises: a new ZAP label must be mapped, not guessed.
+          SEVERITY = {"3": "high", "2": "medium", "1": "low", "0": "informational"}
+          CONFIDENCE = {"0": "false positive", "1": "low", "2": "medium", "3": "high", "4": "confirmed"}
+
+          # A missing or unparsable report is a tool error: let it raise.
+          with open(f"{out}/zap.json") as f:
+              report = json.load(f)
+
+
+          def text(value):
+              # ZAP's desc and reference fields are HTML paragraphs.
+              value = html.unescape(re.sub(r"<[^>]+>", "\n", value or ""))
+              return "\n".join(line.strip() for line in value.splitlines() if line.strip()) or None
+
+
+          rows, seen = [], set()
+          for site in report["site"]:
+              for a in site["alerts"]:
+                  cwe = a.get("cweid")
+                  for i in a["instances"]:
+                      url = urlsplit(i["uri"])
+                      path = f"{i.get('method', 'GET')} {url.path or '/'}"
+                      param = i.get("param") or ""
+                      rule = a.get("alertRef") or a["pluginid"]
+                      fingerprint = hashlib.sha256("\x1f".join(("zap", target, rule, path, param)).encode()).hexdigest()
+                      # "https://site" and "https://site/" are both "GET /".
+                      if fingerprint in seen:
+                          continue
+                      seen.add(fingerprint)
+                      detail = [f"{k}: {i[k]}" for k in ("param", "evidence", "otherinfo") if i.get(k)]
+                      message = "\n".join(filter(None, [a["name"], text(a.get("desc")), *detail]))
+                      rows.append({
+                          "tool": "zap", "target": target, "rule_id": rule, "rule_name": a["name"],
+                          "severity": SEVERITY[a["riskcode"]], "tool_severity": a["riskdesc"],
+                          "confidence": CONFIDENCE[a["confidence"]], "path": path,
+                          "start_line": None, "end_line": None, "message": message,
+                          "cwe": f"CWE-{cwe}" if cwe and int(cwe) > 0 else None, "owasp": None,
+                          "reference": text(a.get("reference")),
+                          "package": None, "package_version": None, "package_type": None, "purl": None,
+                          "fix_state": None, "fix_versions": None,
+                          "fingerprint": fingerprint,
+                      })
+
+          run = {
+              "scan_time": datetime.now(timezone.utc).isoformat(timespec="microseconds"),
+              "repo": env["GITHUB_REPOSITORY"],
+              "commit_sha": env["GITHUB_SHA"],
+              "ref": env["GITHUB_REF"],
+              "trigger": env["GITHUB_EVENT_NAME"],
+              "run_id": int(env["GITHUB_RUN_ID"]),
+              "run_attempt": int(env["GITHUB_RUN_ATTEMPT"]),
+              "pull_request": None,
+              "base_sha": None,
+              "tool_version": report["@version"],
+              "new_vs_base": None,
+          }
+          with open(f"{out}/findings.ndjson", "w") as f:
+              for r in rows:
+                  f.write(json.dumps({**run, **r}) + "\n")
+
+          counts = Counter(r["severity"] for r in rows)
+          alerts = Counter((r["severity"], r["rule_id"], r["rule_name"]) for r in rows)
+          order = {"high": 0, "medium": 1, "low": 2, "informational": 3}
+          with open(env["GITHUB_STEP_SUMMARY"], "a") as f:
+              f.write(f"### DAST scan of {target} (report only)\n\n"
+                      f"ZAP {report['@version']}: {len(rows)} instance(s) of {len(alerts)} alert(s) — "
+                      + ", ".join(f"{counts[s]} {s}" for s in order if counts[s]) + "\n\n")
+              if alerts:
+                  f.write("| severity | alertRef | alert | URLs |\n|---|---|---|---|\n")
+                  for (sev, pid, name), n in sorted(alerts.items(), key=lambda kv: (order[kv[0][0]], kv[0][1])):
+                      f.write(f"| {sev} | {pid} | {name} | {n} |\n")
+          for (sev, pid, name), n in alerts.items():
+              if sev in ("high", "medium"):
+                  print(f"::warning title=ZAP {sev}: {name} ({pid})::{n} instance(s) on {target}")
+
+          with open(env["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"findings={len(rows)}\n")
+
+      - name: Upload findings to Opteryx
+        shell: python
+        env:
+          FINDINGS: ${{ steps.evaluate.outputs.findings }}
+        run: |
+          import os, sys
+          from opteryx_upload import ConflictResolution, GitHubOIDCAuthenticator, Target, UploadClient
+          from rugo.jsonl import read_jsonl
+          from rugo.parquet import write_parquet
+
+          env = os.environ
+          # Identical to security_scan.yaml's: both append to the same table.
+          SCHEMA = {
+              "scan_time": "TIMESTAMP[us]", "repo": "VARCHAR", "commit_sha": "VARCHAR", "ref": "VARCHAR",
+              "trigger": "VARCHAR", "run_id": "INT64", "run_attempt": "INT64", "pull_request": "INT64",
+              "base_sha": "VARCHAR", "tool": "VARCHAR", "tool_version": "VARCHAR", "target": "VARCHAR",
+              "rule_id": "VARCHAR", "rule_name": "VARCHAR", "severity": "VARCHAR", "tool_severity": "VARCHAR",
+              "confidence": "VARCHAR", "path": "VARCHAR", "start_line": "INT64", "end_line": "INT64",
+              "message": "VARCHAR", "cwe": "VARCHAR", "owasp": "VARCHAR", "reference": "VARCHAR",
+              "package": "VARCHAR", "package_version": "VARCHAR", "package_type": "VARCHAR", "purl": "VARCHAR",
+              "fix_state": "VARCHAR", "fix_versions": "VARCHAR", "fingerprint": "VARCHAR", "new_vs_base": "BOOL",
+              }
+          TARGET = Target(workspace="opteryx", collection="ops", dataset="pipeline_scan_findings")
+
+          if env["FINDINGS"] == "0":
+              print("No findings; nothing to upload.")
+              sys.exit(0)
+
+          ndjson = f"{env['OUT']}/findings.ndjson"
+          parquet = f"{env['OUT']}/findings.parquet"
+          with read_jsonl(ndjson, explicit_schema=SCHEMA) as reader:
+              morsels = list(reader)
+          assert len(morsels) == 1, f"expected one morsel from read_jsonl, got {len(morsels)}"
+          with open(parquet, "wb") as f:
+              f.write(write_parquet(morsels[0]))
+
+          commit = UploadClient(token=GitHubOIDCAuthenticator()).upload_and_commit(
+              [parquet],
+              TARGET,
+              snapshot_message=f"dast scan {env['GITHUB_REPOSITORY']} {env['TARGET_URL']} ({env['GITHUB_EVENT_NAME']})",
+              conflict_resolution=ConflictResolution.APPEND,
+          )
+          print(f"uploaded {env['FINDINGS']} findings -> {commit.table} (commit {commit.commit_id})")

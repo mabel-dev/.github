@@ -21,7 +21,9 @@
 # Authentication is GitHub OIDC: no stored secret. The calling repository must
 # be registered in authenticate.opteryx (scripts/register_federated_credential.py)
 # against a client that may append to the dataset, with no job_workflow_ref
-# constraint or one naming this file. Callers grant id-token: write.
+# constraint or one naming this file. Callers grant id-token: write. The
+# upload is the mabel-dev/opteryx-upload action, which installs the client into
+# its own environment; this job's virtualenv holds only the scanners and rugo.
 #
 # SEC-06 Grok review, on pull requests only. Grok reads the pull request's diff
 # and its changed files against the rubric in the "Grok review" step, and its
@@ -98,7 +100,7 @@ jobs:
       GRYPE_VERSION: "0.122.1"
       GRYPE_SHA256: "f1ba7e2917ee1395618de20a98da0aa7c0fb1788927797651047c50502a37538" # grype_0.122.1_linux_amd64.tar.gz
       RUGO_VERSION: "0.5.12"
-      OPTERYX_UPLOAD_VERSION: "0.6.0"
+      OPTERYX_UPLOAD_VERSION: "0.7.0"
       # The registry ruleset the retired per-repo semgrep_scan.yaml used. It is
       # resolved at run time, so the rules are not pinned by SEMGREP_VERSION.
       SEMGREP_RULES: auto
@@ -140,11 +142,13 @@ jobs:
           # newer syntax as a parse error, which this workflow treats as a failure.
           python-version: "3.14"
 
-      - name: Install scanners and the upload client
+      - name: Install the scanners
         run: |
           # Outside the checkouts, so neither tree's scan sees the scanners themselves.
+          # The upload client is not here: the action builds its own environment,
+          # and OPTERYX_UPLOAD_VERSION is its `version` input.
           python -m venv "$RUNNER_TEMP/scanners"
-          pkgs=("semgrep==$SEMGREP_VERSION" "rugo==$RUGO_VERSION" "opteryx-upload==$OPTERYX_UPLOAD_VERSION")
+          pkgs=("semgrep==$SEMGREP_VERSION" "rugo==$RUGO_VERSION")
           if [ "$PYTHON_SCAN" = "true" ]; then pkgs+=("bandit==$BANDIT_VERSION"); fi
           "$RUNNER_TEMP/scanners/bin/pip" install --no-cache-dir "${pkgs[@]}"
           echo "$RUNNER_TEMP/scanners/bin" >> "$GITHUB_PATH"
@@ -530,14 +534,14 @@ jobs:
           with open(env["GITHUB_OUTPUT"], "a") as f:
               f.write(f"new_high_critical={len(new_rows)}\nfindings={len(rows)}\n")
 
-      - name: Upload findings to Opteryx
+      - name: Write the findings as Parquet
+        id: parquet
         shell: python
         env:
           FINDINGS: ${{ steps.evaluate.outputs.findings }}
           FORK: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
         run: |
           import os, sys
-          from opteryx_upload import ConflictResolution, GitHubOIDCAuthenticator, Target, UploadClient
           from rugo.jsonl import read_jsonl
           from rugo.parquet import write_parquet
 
@@ -555,13 +559,21 @@ jobs:
               "package": "VARCHAR", "package_version": "VARCHAR", "package_type": "VARCHAR", "purl": "VARCHAR",
               "fix_state": "VARCHAR", "fix_versions": "VARCHAR", "fingerprint": "VARCHAR", "new_vs_base": "BOOL",
               }
-          TARGET = Target(workspace="opteryx", collection="ops", dataset="pipeline_scan_findings")
+          MESSAGE = (f"security scan {env['GITHUB_REPOSITORY']}@{env['GITHUB_SHA'][:12]} "
+                     f"({env['GITHUB_EVENT_NAME']})")
+
+          def output(**values):
+              with open(env["GITHUB_OUTPUT"], "a") as f:
+                  for name, value in values.items():
+                      f.write(f"{name}={value}\n")
 
           if env["FORK"] == "true":
               print("::notice::Pull request from a fork: GitHub gives it no OIDC token, so nothing is uploaded. The gate still runs.")
+              output(upload="false")
               sys.exit(0)
           if env["FINDINGS"] == "0":
               print("No findings; nothing to upload.")
+              output(upload="false")
               sys.exit(0)
 
           ndjson = f"{env['OUT']}/findings.ndjson"
@@ -571,14 +583,26 @@ jobs:
           assert len(morsels) == 1, f"expected one morsel from read_jsonl, got {len(morsels)}"
           with open(parquet, "wb") as f:
               f.write(write_parquet(morsels[0]))
+          print(f"wrote {env['FINDINGS']} findings to {parquet}")
+          output(upload="true", message=MESSAGE)
 
-          commit = UploadClient(token=GitHubOIDCAuthenticator()).upload_and_commit(
-              [parquet],
-              TARGET,
-              snapshot_message=f"security scan {env['GITHUB_REPOSITORY']}@{env['GITHUB_SHA'][:12]} ({env['GITHUB_EVENT_NAME']})",
-              conflict_resolution=ConflictResolution.APPEND,
-          )
-          print(f"uploaded {env['FINDINGS']} findings -> {commit.table} (commit {commit.commit_id})")
+      # The dataset exists and declares its own column types, so the contract is
+      # agreed against those: nothing here accepts a type that was read from the
+      # data. The client's exit code is the step's, so a refused contract fails
+      # the job - 3 will never pass on a retry, 4 means the destination moved
+      # and a re-run will work.
+      - name: Upload findings to Opteryx
+        if: steps.parquet.outputs.upload == 'true'
+        uses: mabel-dev/opteryx-upload@5f07d9545910c6e643e95b07141d719886326e9e # v1
+        with:
+          files: ${{ env.OUT }}/findings.parquet
+          to: opteryx.ops.pipeline_scan_findings
+          mode: append
+          message: ${{ steps.parquet.outputs.message }}
+          # Demanded rather than inferred from whether a token happens to be in
+          # the environment: this job has no other way to authenticate.
+          auth: oidc
+          version: ${{ env.OPTERYX_UPLOAD_VERSION }}
 
       - name: Fail on new high/critical findings
         if: steps.evaluate.outputs.new_high_critical != '0'

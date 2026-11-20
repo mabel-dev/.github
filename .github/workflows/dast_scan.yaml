@@ -33,6 +33,9 @@
 # federated credential in authenticate.opteryx has a job_workflow_ref
 # constraint, it must also allow this file. Callers grant id-token: write.
 #
+# The upload is the mabel-dev/opteryx-upload action, which installs the client
+# into its own environment; this job's virtualenv holds only rugo.
+#
 
 name: DAST Scan
 
@@ -81,7 +84,7 @@ jobs:
       # is a reviewed change to this file.
       ZAP_IMAGE: ghcr.io/zaproxy/zaproxy:2.17.0@sha256:9624669db72f54d86c4b46a7064518bd9bf79d8c61a4c31befa9923489f328af
       RUGO_VERSION: "0.5.12"
-      OPTERYX_UPLOAD_VERSION: "0.6.0"
+      OPTERYX_UPLOAD_VERSION: "0.7.0"
       TARGET_URL: ${{ inputs.url }}
       RULES: ${{ inputs.rules }}
       MINUTES: ${{ inputs.minutes }}
@@ -100,10 +103,12 @@ jobs:
         with:
           python-version: "3.14"
 
-      - name: Install the upload client
+      - name: Install rugo
         run: |
+          # The upload client is not installed here: the action builds its own
+          # environment, and OPTERYX_UPLOAD_VERSION is its `version` input.
           python -m venv "$RUNNER_TEMP/tools"
-          "$RUNNER_TEMP/tools/bin/pip" install --no-cache-dir "rugo==$RUGO_VERSION" "opteryx-upload==$OPTERYX_UPLOAD_VERSION"
+          "$RUNNER_TEMP/tools/bin/pip" install --no-cache-dir "rugo==$RUGO_VERSION"
           echo "$RUNNER_TEMP/tools/bin" >> "$GITHUB_PATH"
 
       - name: Fetch the OpenAPI document, GET and HEAD only
@@ -270,13 +275,13 @@ jobs:
           with open(env["GITHUB_OUTPUT"], "a") as f:
               f.write(f"findings={len(rows)}\n")
 
-      - name: Upload findings to Opteryx
+      - name: Write the findings as Parquet
+        id: parquet
         shell: python
         env:
           FINDINGS: ${{ steps.evaluate.outputs.findings }}
         run: |
           import os, sys
-          from opteryx_upload import ConflictResolution, GitHubOIDCAuthenticator, Target, UploadClient
           from rugo.jsonl import read_jsonl
           from rugo.parquet import write_parquet
 
@@ -292,10 +297,19 @@ jobs:
               "package": "VARCHAR", "package_version": "VARCHAR", "package_type": "VARCHAR", "purl": "VARCHAR",
               "fix_state": "VARCHAR", "fix_versions": "VARCHAR", "fingerprint": "VARCHAR", "new_vs_base": "BOOL",
               }
-          TARGET = Target(workspace="opteryx", collection="ops", dataset="pipeline_scan_findings")
+          # Whitespace collapsed because this goes through GITHUB_OUTPUT, where a
+          # newline in the caller's url would end the value and start another.
+          MESSAGE = " ".join(f"dast scan {env['GITHUB_REPOSITORY']} {env['TARGET_URL']} "
+                             f"({env['GITHUB_EVENT_NAME']})".split())
+
+          def output(**values):
+              with open(env["GITHUB_OUTPUT"], "a") as f:
+                  for name, value in values.items():
+                      f.write(f"{name}={value}\n")
 
           if env["FINDINGS"] == "0":
               print("No findings; nothing to upload.")
+              output(upload="false")
               sys.exit(0)
 
           ndjson = f"{env['OUT']}/findings.ndjson"
@@ -305,11 +319,23 @@ jobs:
           assert len(morsels) == 1, f"expected one morsel from read_jsonl, got {len(morsels)}"
           with open(parquet, "wb") as f:
               f.write(write_parquet(morsels[0]))
+          print(f"wrote {env['FINDINGS']} findings to {parquet}")
+          output(upload="true", message=MESSAGE)
 
-          commit = UploadClient(token=GitHubOIDCAuthenticator()).upload_and_commit(
-              [parquet],
-              TARGET,
-              snapshot_message=f"dast scan {env['GITHUB_REPOSITORY']} {env['TARGET_URL']} ({env['GITHUB_EVENT_NAME']})",
-              conflict_resolution=ConflictResolution.APPEND,
-          )
-          print(f"uploaded {env['FINDINGS']} findings -> {commit.table} (commit {commit.commit_id})")
+      # The dataset exists and declares its own column types, so the contract is
+      # agreed against those: nothing here accepts a type that was read from the
+      # data. The client's exit code is the step's, so a refused contract fails
+      # the job - 3 will never pass on a retry, 4 means the destination moved
+      # and a re-run will work.
+      - name: Upload findings to Opteryx
+        if: steps.parquet.outputs.upload == 'true'
+        uses: mabel-dev/opteryx-upload@5f07d9545910c6e643e95b07141d719886326e9e # v1
+        with:
+          files: ${{ env.OUT }}/findings.parquet
+          to: opteryx.ops.pipeline_scan_findings
+          mode: append
+          message: ${{ steps.parquet.outputs.message }}
+          # Demanded rather than inferred from whether a token happens to be in
+          # the environment: this job has no other way to authenticate.
+          auth: oidc
+          version: ${{ env.OPTERYX_UPLOAD_VERSION }}

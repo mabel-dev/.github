@@ -23,6 +23,19 @@
 # against a client that may append to the dataset, with no job_workflow_ref
 # constraint or one naming this file. Callers grant id-token: write.
 #
+# SEC-06 Grok review, on pull requests only. Grok reads the pull request's diff
+# and its changed files against the rubric in the "Grok review" step, and its
+# findings land in the same table (tool = grok). It is report-only: Grok
+# findings never fail the job. Nothing about them is printed to the log or the
+# step summary beyond counts, because both are public on a public repository.
+# On a private repository each one is also annotated on the run.
+#   - Skipped with a notice when XAI_API_KEY is not passed (a fork pull
+#     request, or a repository the org secret is not granted to).
+#   - Skipped with a warning when the xAI API refuses or fails (out of credit,
+#     rate limited, down) or the pull request is too large: the other tools
+#     still run and gate.
+#   - Fails the job only on our side: a reply with no valid finding array.
+#
 
 name: Security Scan
 
@@ -51,6 +64,19 @@ on:
         type: string
         required: false
         default: ""
+      grok-model:
+        description: >-
+          xAI model for the Grok pull request review. Set once here, so changing
+          it is a reviewed change to this file; a caller may override it.
+        type: string
+        required: false
+        default: "grok-4.7"
+    secrets:
+      XAI_API_KEY:
+        description: >-
+          xAI API key for the Grok pull request review. Without it the review is
+          skipped and the rest of the scan runs as before.
+        required: false
 
 permissions:
   contents: read
@@ -84,6 +110,7 @@ jobs:
       PYTHON_SCAN: ${{ inputs.python }}
       BANDIT_CONFIG: ${{ inputs.bandit-config }}
       IMAGE_REF: ${{ inputs.image-ref }}
+      GROK_MODEL: ${{ inputs.grok-model }}
       OUT: ${{ github.workspace }}/security-scan
       BASE_OUT: ${{ github.workspace }}/security-scan-base
     steps:
@@ -94,6 +121,9 @@ jobs:
         with:
           path: head
           persist-credentials: false
+          # On a pull request, HEAD^1 is the base, so the Grok review can diff
+          # the merge commit without a second fetch.
+          fetch-depth: ${{ github.event_name == 'pull_request' && 2 || 1 }}
 
       - name: Check out the pull request base
         if: github.event_name == 'pull_request'
@@ -158,14 +188,159 @@ jobs:
           if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then scan base "$BASE_OUT"; fi
           if [ -n "$IMAGE_REF" ]; then grype "$IMAGE_REF" -o json --file "$OUT/grype-image.json"; fi
 
+      # Writes $OUT/grok.json (the finding array) or $OUT/grok-status.txt (why
+      # it was skipped). Evaluate turns the findings into rows.
+      - name: Grok review
+        if: github.event_name == 'pull_request'
+        shell: python
+        env:
+          XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
+        run: |
+          import json, os, pathlib, subprocess, sys, urllib.error, urllib.request
+
+          env = os.environ
+          head = pathlib.Path(env["GITHUB_WORKSPACE"], "head")
+          out = pathlib.Path(env["OUT"])
+          out.mkdir(parents=True, exist_ok=True)
+          SEVERITIES = {"CRITICAL", "HIGH", "MEDIUM", "LOW"}
+          KEYS = {"title", "severity", "area", "status", "location", "exploit", "fix"}
+          # shortcut: one request with a size cap, so a larger pull request is skipped; split it per file if big ones need review.
+          MAX_CHARS = 600_000
+
+          RUBRIC = """\
+          You are a security reviewer for the opteryx.app hosted service: a multi-tenant
+          SQL query service on Google Cloud. You are given ONE pull request: its unified
+          diff, and the full new version of every file it changes, with line numbers.
+          Report only security problems that this pull request introduces or newly
+          exposes. Use the full files for context, not as a general audit.
+
+          System model:
+          - Public front doors on Cloud Run, with no WAF; all authentication is in the
+            app. Tokens are RS256 JWTs from authenticate.opteryx.app (aud "opteryx").
+          - Tenancy: a billing account (roles admin, member) owns workspaces; a workspace
+            holds collections, which hold datasets. Data permissions (owner, writer,
+            reader) come from the opteryx-access library and are separate from billing
+            roles. Billing accounts can verify an email domain and set an IdP policy.
+          - Workers run every query on GCE with a service account that has the
+            cloud-platform scope. Anything the engine or a connector can be made to
+            fetch, it fetches with that identity, from inside the VPC (10.142.0.0/20).
+          - agent.opteryx.app hosts an LLM agent and an MCP endpoint whose tools must run
+            as the calling user.
+
+          Look for:
+          - Authentication: JWT alg/iss/aud/exp checks, routes missing an auth
+            dependency, token-type confusion (PAT, service account, federated), internal
+            or Scheduler/Tasks endpoints that accept any valid token, OAuth redirect_uri,
+            state and PKCE, revocation and suspension.
+          - Authorization and tenant isolation: IDs from the path, body or query used to
+            build Firestore, GCS or SQL paths without a permission check on that object;
+            parent checked but child fetched by ID; billing admin versus member;
+            domain-lock or IdP-policy bypass; patterns or names containing "." or "*".
+          - Injection: SQL built from user input (identifiers and literals), user SQL or
+            table functions reaching files, URLs or other tenants; prompt injection where
+            data reaches an LLM that can write, call tools or fetch URLs; command, template,
+            header, path traversal, XSS (innerHTML, attributes), unsafe deserialisation.
+          - Secrets: in code, logs, errors, URLs or GET responses; signing keys.
+          - SSRF: any outbound request whose URL or host comes from a user or tenant
+            (connectors, catalog URIs, webhooks, LLM base URLs, OIDC discovery). Metadata
+            server, RFC1918, loopback, link-local, redirects, DNS rebinding. Library
+            options that load code or send ambient credentials (for example pyiceberg
+            auth.type custom or google) count as CRITICAL.
+          - Multi-tenant leakage: caches keyed without tenant, 404 versus 403, unfiltered
+            listings, logs readable by other tenants.
+          - Rate limiting on login, token, sign-up, invite and email endpoints.
+          - Dependencies: unpinned versions, curl | sh, unmaintained libraries.
+          - Browser: CORS reflection, cookie flags, tokens in localStorage, CSP.
+
+          Severity: CRITICAL = unauthenticated or any-tenant access to another tenant's
+          data or secrets, RCE, token forgery, cloud credentials. HIGH = authenticated
+          cross-tenant access, privilege escalation, domain-lock bypass, SSRF to internal
+          addresses. MEDIUM = cross-tenant metadata leaks, missing authz on low-value
+          objects, secrets in logs, public-only SSRF, no rate limit on auth. LOW =
+          defence in depth with no demonstrated path.
+
+          Rules: tie every finding to a line in the new version of a changed file. Give a
+          concrete attacker, request and result. No style, tests, or theoretical issues
+          with no reachable path. Fewer real findings beat many speculative ones.
+
+          Reply with ONLY a JSON array, empty if there is nothing to report. Each element:
+          {"title": one line, "severity": "CRITICAL"|"HIGH"|"MEDIUM"|"LOW",
+           "area": the area above, "status": "CONFIRMED"|"PLAUSIBLE",
+           "location": "path:line", "exploit": attacker, request and result,
+           "fix": the smallest change that closes it}
+          """
+
+
+          def skip(reason, level="warning"):
+              # Counts and reasons only: the log is public on a public repository.
+              print(f"::{level} title=Grok review skipped::{reason}")
+              (out / "grok-status.txt").write_text(reason)
+              sys.exit(0)
+
+
+          def git(*args):
+              return subprocess.run(["git", "-C", str(head), *args], check=True, capture_output=True,
+                                    text=True, errors="replace").stdout
+
+
+          if not env.get("XAI_API_KEY"):
+              skip("no XAI_API_KEY (a fork pull request, or this repository is not granted the secret)", "notice")
+
+          diff = git("diff", "--no-color", "--no-ext-diff", "HEAD^1", "HEAD")
+          changed = [p for p in git("diff", "--name-only", "--diff-filter=d", "HEAD^1", "HEAD").splitlines() if p]
+          if not diff:
+              skip("the pull request changes nothing", "notice")
+          sources = []
+          for rel in changed:
+              text = (head / rel).read_text(errors="replace")
+              if "\0" in text:
+                  continue  # binary: nothing for a text review to read
+              numbered = "\n".join(f"{i}: {line}" for i, line in enumerate(text.splitlines(), 1))
+              sources.append(f"=== {rel}\n{numbered}")
+          prompt = (f"Repository: {env['GITHUB_REPOSITORY']}.\n\n## Diff\n\n{diff}\n\n"
+                    "## Changed files (new version, numbered)\n\n" + "\n\n".join(sources))
+          if len(prompt) > MAX_CHARS:
+              skip(f"the pull request is too large for one review ({len(prompt)} characters, cap {MAX_CHARS})")
+
+          request = urllib.request.Request(
+              "https://api.x.ai/v1/chat/completions",
+              data=json.dumps({"model": env["GROK_MODEL"], "messages": [
+                  {"role": "system", "content": RUBRIC}, {"role": "user", "content": prompt}]}).encode(),
+              headers={"Authorization": f"Bearer {env['XAI_API_KEY']}", "Content-Type": "application/json"},
+          )
+          # Anything the xAI side does wrong (out of credit, rate limited, down)
+          # skips the review rather than failing the pull request.
+          try:
+              with urllib.request.urlopen(request, timeout=900) as response:
+                  reply = json.load(response)
+          except urllib.error.HTTPError as e:
+              skip(f"xAI API returned HTTP {e.code}: {e.read().decode(errors='replace')[:300]}")
+          except (urllib.error.URLError, TimeoutError) as e:
+              skip(f"xAI API unreachable: {e}")
+
+          # From here on a bad reply is our problem, so it fails the job.
+          content = reply["choices"][0]["message"]["content"]
+          start, end = content.find("["), content.rfind("]")
+          if start < 0 or end < start:
+              sys.exit(f"Grok's reply has no JSON array ({len(content)} characters).")
+          findings = json.loads(content[start:end + 1])
+          for f in findings:
+              missing = KEYS - f.keys()
+              if missing or f["severity"] not in SEVERITIES:
+                  sys.exit(f"A Grok finding is malformed: missing {sorted(missing)}, severity {f.get('severity')!r}.")
+          (out / "grok.json").write_text(json.dumps(findings))
+          print(f"Grok ({env['GROK_MODEL']}) reported {len(findings)} finding(s).")
+
       # Fails on tool errors only. Findings are flattened to rows here and
       # judged by the last step, so they are still uploaded on a pull request
       # that the gate is about to fail.
       - name: Evaluate
         id: evaluate
         shell: python
+        env:
+          REPO_PRIVATE: ${{ github.event.repository.private }}
         run: |
-          import hashlib, json, os, sys
+          import hashlib, json, os, re, sys
           from collections import Counter
           from datetime import datetime, timezone
 
@@ -183,6 +358,7 @@ jobs:
                               "MEDIUM": "medium", "INFO": "low", "LOW": "low"}
           GRYPE_SEVERITY = {"Critical": "critical", "High": "high", "Medium": "medium", "Low": "low",
                             "Negligible": "negligible", "Unknown": "unknown"}
+          GROK_SEVERITY = {"CRITICAL": "critical", "HIGH": "high", "MEDIUM": "medium", "LOW": "low"}
           GATED = {"critical", "high"}
 
 
@@ -277,6 +453,29 @@ jobs:
               rows += head_rows
               summary.append((tool, target, len(head_rows), len(gated), new))
 
+
+          def flatten_grok(g):
+              # Never gated (new_vs_base stays null): an LLM finding is advice, not a build failure.
+              m = re.match(r"`?([^`:\s]+):(\d+)", g["location"])
+              path, line = (m[1], int(m[2])) if m else (g["location"], None)
+              in_tree = line is not None and ".." not in path.split("/") and os.path.isfile(f"{ws}/head/{path}")
+              anchor = (source("head", path, line, line) if in_tree else "") or g["title"]
+              return finding("grok", "pull request", g["area"], GROK_SEVERITY[g["severity"]], g["severity"], path,
+                             line, line, f"{g['exploit']}\nFix: {g['fix']}", anchor,
+                             rule_name=g["title"], confidence=g["status"])
+
+
+          grok_rows = []
+          if os.path.exists(f"{out}/grok.json"):
+              with open(f"{out}/grok.json") as f:
+                  grok_rows = [flatten_grok(g) for g in json.load(f)]
+              rows += grok_rows
+              summary.append(("grok", "pull request", len(grok_rows),
+                              sum(r["severity"] in GATED for r in grok_rows), "report only"))
+          elif os.path.exists(f"{out}/grok-status.txt"):
+              with open(f"{out}/grok-status.txt") as f:
+                  summary.append(("grok", "pull request", f"skipped: {f.read().replace('|', '/')}", "", "report only"))
+
           if errors:
               for e in errors:
                   print(f"::error title=Security scan tool error::{e}")
@@ -296,6 +495,13 @@ jobs:
               title = esc_prop(f"New {r['severity']} {r['tool']} finding: {r['rule_id']}")
               print(f"::error file={esc_prop(r['path'])},line={r['start_line'] or 1},title={title}::{esc(r['message'] or r['rule_id'])}")
 
+          # Annotations are public on a public repository, so Grok findings are
+          # annotated only on a private one; elsewhere they are in the table only.
+          if env["REPO_PRIVATE"] == "true":
+              for r in grok_rows:
+                  title = esc_prop(f"Grok {r['severity']}: {r['rule_name']}")
+                  print(f"::warning file={esc_prop(r['path'])},line={r['start_line'] or 1},title={title}::{esc(r['message'])}")
+
           run = {
               "scan_time": datetime.now(timezone.utc).isoformat(timespec="microseconds"),
               "repo": env["GITHUB_REPOSITORY"],
@@ -307,7 +513,8 @@ jobs:
               "pull_request": pr["number"] if is_pr else None,
               "base_sha": pr["base"]["sha"] if is_pr else None,
           }
-          versions = {"bandit": env["BANDIT_VERSION"], "semgrep": env["SEMGREP_VERSION"], "grype": env["GRYPE_VERSION"]}
+          versions = {"bandit": env["BANDIT_VERSION"], "semgrep": env["SEMGREP_VERSION"], "grype": env["GRYPE_VERSION"],
+                      "grok": env["GROK_MODEL"]}
           with open(f"{out}/findings.ndjson", "w") as f:
               for r in rows:
                   f.write(json.dumps({**run, "tool_version": versions[r["tool"]], "new_vs_base": None, **r}) + "\n")

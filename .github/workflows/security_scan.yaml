@@ -34,8 +34,8 @@
 #   - Skipped with a notice when XAI_API_KEY is not passed (a fork pull
 #     request, or a repository the org secret is not granted to).
 #   - Skipped with a warning when the xAI API refuses or fails (out of credit,
-#     rate limited, down) or the pull request is too large: the other tools
-#     still run and gate.
+#     rate limited, down), gives no full reply within grok-timeout-minutes, or
+#     the pull request is too large: the other tools still run and gate.
 #   - Fails the job only on our side: a reply with no valid finding array.
 #
 
@@ -73,6 +73,14 @@ on:
         type: string
         required: false
         default: "grok-4.7"
+      grok-timeout-minutes:
+        description: >-
+          Wall-clock limit on the Grok review's API call, from sending the
+          request to the last byte of the reply. Past it the review is skipped
+          with a warning, not failed, so a slow model cannot hold up the scan.
+        type: number
+        required: false
+        default: 5
     secrets:
       XAI_API_KEY:
         description: >-
@@ -113,6 +121,7 @@ jobs:
       BANDIT_CONFIG: ${{ inputs.bandit-config }}
       IMAGE_REF: ${{ inputs.image-ref }}
       GROK_MODEL: ${{ inputs.grok-model }}
+      GROK_TIMEOUT_MINUTES: ${{ inputs.grok-timeout-minutes }}
       OUT: ${{ github.workspace }}/security-scan
       BASE_OUT: ${{ github.workspace }}/security-scan-base
     steps:
@@ -200,7 +209,7 @@ jobs:
         env:
           XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
         run: |
-          import json, os, pathlib, subprocess, sys, urllib.error, urllib.request
+          import json, os, pathlib, signal, subprocess, sys, urllib.error, urllib.request
 
           env = os.environ
           head = pathlib.Path(env["GITHUB_WORKSPACE"], "head")
@@ -312,15 +321,41 @@ jobs:
                   {"role": "system", "content": RUBRIC}, {"role": "user", "content": prompt}]}).encode(),
               headers={"Authorization": f"Bearer {env['XAI_API_KEY']}", "Content-Type": "application/json"},
           )
-          # Anything the xAI side does wrong (out of credit, rate limited, down)
-          # skips the review rather than failing the pull request.
+          # The socket timeout only bounds each read, so a reply that trickles in
+          # could run on to the job's own limit. SIGALRM bounds the whole call.
+          # BaseException, so nothing between here and the socket can swallow it.
+          class Deadline(BaseException):
+              pass
+
+
+          def on_alarm(signum, frame):
+              raise Deadline
+
+
+          def call():
+              try:
+                  with urllib.request.urlopen(request, timeout=timeout) as response:
+                      return json.load(response), None
+              except urllib.error.HTTPError as e:
+                  return None, f"xAI API returned HTTP {e.code}: {e.read().decode(errors='replace')[:300]}"
+              except (urllib.error.URLError, TimeoutError) as e:
+                  return None, f"xAI API unreachable: {e}"
+
+
+          # Anything the xAI side does wrong (out of credit, rate limited, down,
+          # too slow) skips the review rather than failing the pull request.
+          minutes = float(env["GROK_TIMEOUT_MINUTES"])
+          timeout = max(1, int(minutes * 60))
+          signal.signal(signal.SIGALRM, on_alarm)
+          signal.alarm(timeout)
           try:
-              with urllib.request.urlopen(request, timeout=900) as response:
-                  reply = json.load(response)
-          except urllib.error.HTTPError as e:
-              skip(f"xAI API returned HTTP {e.code}: {e.read().decode(errors='replace')[:300]}")
-          except (urllib.error.URLError, TimeoutError) as e:
-              skip(f"xAI API unreachable: {e}")
+              reply, failure = call()
+          except Deadline:
+              reply, failure = None, f"no complete reply from the xAI API within {minutes:g} minute(s)"
+          finally:
+              signal.alarm(0)
+          if failure:
+              skip(failure)
 
           # From here on a bad reply is our problem, so it fails the job.
           content = reply["choices"][0]["message"]["content"]

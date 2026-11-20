@@ -1,12 +1,18 @@
 #
-# SEC-07 fleet DAST scan: the OWASP ZAP baseline scan of a deployed site,
-# defined once and called from each mabel-dev repository that serves one. The
-# caller owns only the triggers (after its deploy, and a daily cron) and the URL.
+# SEC-07 fleet DAST scan: OWASP ZAP against a deployed site or API, defined
+# once and called from each mabel-dev repository that serves one. The caller
+# owns only the triggers (after its deploy, and a daily cron), the URL and,
+# for an API, where its OpenAPI document is.
 #
-# The baseline scan is passive: it spiders the site and inspects the responses
-# (headers, cookies, CORS, caching, information leaks). It sends no attack
-# payloads and submits no forms, so it is safe against production. The active
-# scan is deliberately not offered here.
+# Both modes are passive: ZAP inspects the responses (headers, cookies, CORS,
+# caching, information leaks) and sends no attack payloads. The active scan is
+# deliberately not offered here: these run against production.
+#   - site (no openapi input): zap-baseline.py spiders the site from the URL.
+#   - API (openapi set): zap-api-scan.py -S (safe mode) requests every
+#     operation in the OpenAPI document. Before ZAP sees the document, every
+#     operation but GET and HEAD is removed: ZAP imports a document by calling
+#     each operation with made-up values, and a POST or DELETE that accepted
+#     them would change production data.
 #
 # Findings are flattened to the same row format as security_scan.yaml and
 # appended to opteryx.ops.pipeline_scan_findings:
@@ -45,8 +51,15 @@ on:
         type: string
         required: false
         default: ""
+      openapi:
+        description: >-
+          Path of the OpenAPI document on the URL, e.g. /openapi.json. Set, it
+          scans the API's GET and HEAD operations instead of spidering a site.
+        type: string
+        required: false
+        default: ""
       minutes:
-        description: Spider duration in minutes (zap-baseline.py -m).
+        description: Spider duration in minutes (zap-baseline.py -m). Site mode only.
         type: number
         required: false
         default: 2
@@ -57,7 +70,7 @@ permissions:
 
 jobs:
   scan:
-    name: ZAP baseline
+    name: ZAP ${{ inputs.openapi == '' && 'baseline' || 'API (safe mode)' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     defaults:
@@ -72,6 +85,7 @@ jobs:
       TARGET_URL: ${{ inputs.url }}
       RULES: ${{ inputs.rules }}
       MINUTES: ${{ inputs.minutes }}
+      OPENAPI: ${{ inputs.openapi }}
       OUT: ${{ github.workspace }}/dast-scan
     steps:
       - name: Check out the caller (for its rules file)
@@ -92,6 +106,34 @@ jobs:
           "$RUNNER_TEMP/tools/bin/pip" install --no-cache-dir "rugo==$RUGO_VERSION" "opteryx-upload==$OPTERYX_UPLOAD_VERSION"
           echo "$RUNNER_TEMP/tools/bin" >> "$GITHUB_PATH"
 
+      - name: Fetch the OpenAPI document, GET and HEAD only
+        if: inputs.openapi != ''
+        shell: python
+        run: |
+          import json, os, urllib.request
+
+          env = os.environ
+          url = env["TARGET_URL"].rstrip("/") + env["OPENAPI"]
+          os.makedirs(env["OUT"], exist_ok=True)
+          with urllib.request.urlopen(url, timeout=60) as r:
+              spec = json.load(r)
+          kept, dropped = [], []
+          for path, item in list(spec["paths"].items()):
+              for method in list(item):
+                  if method in ("get", "head"):
+                      kept.append(f"{method.upper()} {path}")
+                  elif method in ("post", "put", "patch", "delete", "options", "trace"):
+                      del item[method]
+                      dropped.append(f"{method.upper()} {path}")
+              if not {"get", "head"} & item.keys():
+                  del spec["paths"][path]
+          if not kept:
+              raise SystemExit(f"{url} has no GET or HEAD operations to scan.")
+          with open(f"{env['OUT']}/openapi.json", "w") as f:
+              json.dump(spec, f)
+          print(f"{url}: scanning {len(kept)} GET/HEAD operations; left out {len(dropped)}:")
+          print("\n".join(f"  {d}" for d in dropped))
+
       - name: Scan
         run: |
           mkdir -p "$OUT"
@@ -103,17 +145,23 @@ jobs:
             config=(-c rules.tsv)
           fi
           docker pull -q "$ZAP_IMAGE"
+          if [ -n "$OPENAPI" ]; then
+            # -S: safe mode, no active scan. -O: the document has no servers
+            # entry, so name the host its operations are called on.
+            scan=(zap-api-scan.py -t openapi.json -f openapi -O "$TARGET_URL" -S)
+          else
+            scan=(zap-baseline.py -t "$TARGET_URL" -m "$MINUTES")
+          fi
           # -I: warnings do not set the exit code. 0 = clean, 1 = FAIL-level
           # alerts, 2 = warnings; all are findings, judged by nothing here.
           # 3 or above is ZAP itself failing.
           set +e
-          docker run --rm -v "$OUT:/zap/wrk:rw" "$ZAP_IMAGE" \
-            zap-baseline.py -t "$TARGET_URL" -m "$MINUTES" -J zap.json -I "${config[@]}"
+          docker run --rm -v "$OUT:/zap/wrk:rw" "$ZAP_IMAGE" "${scan[@]}" -J zap.json -I "${config[@]}"
           rc=$?
           set -e
-          echo "zap-baseline.py exited $rc"
+          echo "${scan[0]} exited $rc"
           if [ "$rc" -ge 3 ]; then
-            echo "::error title=ZAP failed::zap-baseline.py exited $rc; the scan is incomplete and nothing is uploaded."
+            echo "::error title=ZAP failed::${scan[0]} exited $rc; the scan is incomplete and nothing is uploaded."
             exit 1
           fi
           # ZAP exits 0 even when it could not write the report.
@@ -149,8 +197,15 @@ jobs:
               return "\n".join(line.strip() for line in value.splitlines() if line.strip()) or None
 
 
-          rows, seen = [], set()
+          # ZAP follows redirects off the target (an OAuth authorize endpoint to
+          # accounts.google.com, a link to the marketing site) and reports on
+          # those hosts too. They are not this repository's findings.
+          host = urlsplit(target).netloc
+          rows, seen, elsewhere = [], set(), Counter()
           for site in report["site"]:
+              if urlsplit(site["@name"]).netloc != host:
+                  elsewhere[site["@name"]] += sum(len(a["instances"]) for a in site["alerts"])
+                  continue
               for a in site["alerts"]:
                   cwe = a.get("cweid")
                   for i in a["instances"]:
@@ -201,6 +256,9 @@ jobs:
               f.write(f"### DAST scan of {target} (report only)\n\n"
                       f"ZAP {report['@version']}: {len(rows)} instance(s) of {len(alerts)} alert(s) — "
                       + ", ".join(f"{counts[s]} {s}" for s in order if counts[s]) + "\n\n")
+              if elsewhere:
+                  f.write("Left out, on other hosts reached by redirect: "
+                          + ", ".join(f"{s} ({n})" for s, n in sorted(elsewhere.items())) + "\n\n")
               if alerts:
                   f.write("| severity | alertRef | alert | URLs |\n|---|---|---|---|\n")
                   for (sev, pid, name), n in sorted(alerts.items(), key=lambda kv: (order[kv[0][0]], kv[0][1])):
